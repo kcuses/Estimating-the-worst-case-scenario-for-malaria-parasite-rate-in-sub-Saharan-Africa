@@ -37,6 +37,10 @@ The repository accompanies the manuscript:
 ├── plotting/
 │   └── final_incidence_average_cases_mapping.ipynb
 │
+├── extras/
+│   ├── obsvpred.ipynb
+│   └── regression_evi.ipynb
+│
 ├── requirements.txt
 ├── requirements_r.txt
 └── README.md
