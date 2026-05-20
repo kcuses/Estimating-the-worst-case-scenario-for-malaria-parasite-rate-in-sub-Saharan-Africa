@@ -1,90 +1,272 @@
-from pydrive.auth import GoogleAuth
-from pydrive.drive import GoogleDrive
-from oauth2client.service_account import ServiceAccountCredentials
-import os
-import ee
-print('imports done')
+"""
+Google Earth Engine Landsat-8 Image Export Pipeline
+---------------------------------------------------
+This script downloads Landsat-8 composite imagery for malaria
+prediction locations across sub-Saharan Africa using Google Earth Engine.
 
-service_account = 'id-230224@ee-chakradeokaustubh.iam.gserviceaccount.com'
-credentials = ee.ServiceAccountCredentials(service_account, 'credentials.json')
-ee.Initialize(credentials)
-print('init done')
+Authentication:
+Before running:
+    earthengine authenticate
+"""
 
-gauth = GoogleAuth()
-scopes = ['https://www.googleapis.com/auth/drive']
-gauth.credentials = ServiceAccountCredentials(service_account, 'credentials.json')
-
-drive = GoogleDrive(gauth)
-
+# ============================================================
+# Imports
+# ============================================================
 
 import time
-#import rasterio
-import numpy as np
+
+import ee
 import pandas as pd
-import matplotlib.pyplot as plt
 
-# Here we have different csv files containing the lat lons for all countries. 
-africa_all_db = pd.read_csv('/home/download_ee/country_Guinea.csv')
 
-def downloadMapDataToDrive(bandSelection = "RGB", db = africa_all_db,
-                           batchSize = 5000, batchStart=0, resolution = 0.04166665 ,
-                           dims = '224x224'):
-    
-    print('starting downloadMapDataToDrive at :', batchStart, flush=True)
-    #These bands are reasonable, but also explore others.
-    if bandSelection == "RGB":
-        bands = ['B4','B3','B2']
-        #bands = ['SR_B4','SR_B3','SR_B2']
-    elif bandSelection == "IR":
-        bands = ['B7','B6','B5']
-    else:
-        print("pick custom bands")
+# ============================================================
+# Earth Engine Authentication
+# ============================================================
 
-    # Landsat has since updated their collection
-    collection = ee.ImageCollection('LANDSAT/LC08/C01/T1')
-    raster = ee.Algorithms.Landsat.simpleComposite(collection, 50, 10).select(bands)
+# Modern authentication workflow
+# Run once in terminal:
+# earthengine authenticate
 
-    for i in range(batchStart, batchSize):
-        lonMin =  db['lon'].iloc[i] - resolution
-        latMin =  db['lat'].iloc[i] - resolution
-        lonMax =  db['lon'].iloc[i] + resolution
-        latMax =  db['lat'].iloc[i] + resolution
-        geometry = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax])
+ee.Initialize()
 
-        geometry = geometry['coordinates'][0]
-        #Google doesn't like dots in the name, so replacing with dd
-        #pw=str(db['pixel_width'].iloc[i]).replace('.', 'dd')
-        #ph=str(db['pixel_height'].iloc[i]).replace('.', 'dd')
-        lon=str(db['lon'].iloc[i]).replace('.', 'dd')
-        lat=str(db['lat'].iloc[i]).replace('.', 'dd')
-        #cell_name=str(db['cellname'].iloc[i]).replace('.','dd')
-        country=str(db['country_code'].iloc[i]).replace('.','dd')
-        fileName = str(i)+"-IMAGE_"+bandSelection+"_"+str(resolution)[2:5]+"_"+dims+"_"+str(lon)+"_"+str(lat)+"_"+str(country)
+print("Earth Engine initialized successfully.")
 
-        print(fileName, flush=True)
-        # Images can only be saved to drive
-        task = ee.batch.Export.image.toDrive(image=raster,
-                                             description="imageToDrive",
-                                             folder="guinea",
-                                             fileNamePrefix=fileName,
-                                             dimensions=dims,
-                                             region=geometry)
-        #drive_folder = 'ee'
-        #target_path = os.path.join(drive_folder, fileName)
-        #if os.path.exists(target_path):
-        #    print("Image already exists in the directory. Skipping export.")
-        #else:    
+
+# ============================================================
+# Configuration Parameters
+# ============================================================
+
+# Input CSV containing survey locations
+# Use separate CSV files for separate countries to run scripts in parallel 
+INPUT_CSV = "data/country_Guinea.csv"
+
+# Google Drive export folder
+DRIVE_FOLDER = "guinea"
+
+# Temporal filtering
+START_DATE = "2013-01-01"
+END_DATE = "2022-12-31"
+
+# Export dimensions
+IMAGE_DIMS = "224x224"
+
+# Half-width of image patch in degrees approximately corresponds to a 10 km × 10 km spatial window
+PATCH_RESOLUTION = 0.04166665
+
+# RGB bands from Landsat Collection 2
+RGB_BANDS = ["SR_B4", "SR_B3", "SR_B2"]
+
+# Cloud filtering
+MAX_CLOUD_COVER = 20
+
+# Export throttling
+EXPORT_DELAY_SECONDS = 10
+BATCH_PAUSE_INTERVAL = 100
+BATCH_PAUSE_SECONDS = 600
+
+# ============================================================
+# Load Survey Locations
+# ============================================================
+
+print("Loading survey locations...")
+
+locations = pd.read_csv(INPUT_CSV)
+
+print(f"Loaded {len(locations)} locations.")
+
+
+# ============================================================
+# Landsat Composite Construction
+# ============================================================
+
+def build_landsat_composite():
+    """
+    Build cloud-reduced Landsat-8 composite.
+
+    Returns
+    -------
+    ee.Image
+        Composite image
+    """
+
+    print("Building Landsat composite...")
+
+    # Old collection = ee.ImageCollection('LANDSAT/LC08/C01/T1')
+    collection = (
+        ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+        .filterDate(START_DATE, END_DATE)
+        .filter(ee.Filter.lt("CLOUD_COVER", MAX_CLOUD_COVER))
+    )
+
+    # Median composite reduces cloud artefacts
+    composite = (
+        collection
+        .median()
+        .select(RGB_BANDS)
+    )
+
+    return composite
+
+
+# ============================================================
+# Geometry Construction
+# ============================================================
+
+def create_patch_geometry(lon, lat, resolution):
+    """
+    Create rectangular geometry around a location.
+
+    Parameters
+    ----------
+    lon : float
+        Longitude
+    lat : float
+        Latitude
+    resolution : float
+        Half-width of patch in degrees
+
+    Returns
+    -------
+    ee.Geometry.Rectangle
+    """
+
+    return ee.Geometry.Rectangle([
+        lon - resolution,
+        lat - resolution,
+        lon + resolution,
+        lat + resolution
+    ])
+
+
+# ============================================================
+# Filename Construction
+# ============================================================
+
+def create_filename(index, lon, lat, country_code):
+    """
+    Create reproducible filename for exports.
+    """
+
+    lon_str = str(lon).replace(".", "dd")
+    lat_str = str(lat).replace(".", "dd")
+
+    return (
+        f"{index}_IMAGE_RGB_"
+        f"{IMAGE_DIMS}_"
+        f"{lon_str}_{lat_str}_{country_code}"
+    )
+
+
+# ============================================================
+# Image Export Function
+# ============================================================
+
+def export_images_to_drive(
+    dataframe,
+    start_index=0,
+    end_index=None
+):
+    """
+    Export Landsat image patches to Google Drive.
+
+    Parameters
+    ----------
+    dataframe : pandas.DataFrame
+        Survey locations
+    start_index : int
+        Start index
+    end_index : int
+        End index
+    """
+
+    if end_index is None:
+        end_index = len(dataframe)
+
+    composite = build_landsat_composite()
+
+    print(
+        f"Starting exports from "
+        f"{start_index} to {end_index}"
+    )
+
+    for i in range(start_index, end_index):
+
+        # ----------------------------------------------------
+        # Extract coordinates
+        # ----------------------------------------------------
+
+        lon = dataframe["lon"].iloc[i]
+        lat = dataframe["lat"].iloc[i]
+
+        country = str(
+            dataframe["country_code"].iloc[i]
+        )
+
+        # ----------------------------------------------------
+        # Create geometry
+        # ----------------------------------------------------
+
+        geometry = create_patch_geometry(
+            lon,
+            lat,
+            PATCH_RESOLUTION
+        )
+
+        # ----------------------------------------------------
+        # Construct filename
+        # ----------------------------------------------------
+
+        filename = create_filename(
+            i,
+            lon,
+            lat,
+            country
+        )
+
+        print(f"Submitting export: {filename}")
+
+        # ----------------------------------------------------
+        # Export image to Google Drive
+        # ----------------------------------------------------
+
+        task = ee.batch.Export.image.toDrive(
+            image=composite,
+            description=f"landsat_export_{i}",
+            folder=DRIVE_FOLDER,
+            fileNamePrefix=filename,
+            region=geometry,
+            dimensions=IMAGE_DIMS,
+            maxPixels=1e13
+        )
+
         task.start()
-        time.sleep(10)
+
+        # ----------------------------------------------------
+        # Avoid Earth Engine rate limits
+        # ----------------------------------------------------
+
+        time.sleep(EXPORT_DELAY_SECONDS)
+
+        if (i + 1) % BATCH_PAUSE_INTERVAL == 0:
+
+            print(
+                "Pausing temporarily to avoid "
+                "Earth Engine task throttling..."
+            )
+
+            time.sleep(BATCH_PAUSE_SECONDS)
 
 
-        if (i+1) % 100 == 0:
-            print('sleeping to write', flush=True)
-            time.sleep(10*60)
+# ============================================================
+# Main Execution
+# ============================================================
 
-downloadMapDataToDrive(bandSelection = "RGB",
-                       db = africa_all_db,
-                       batchSize = len(africa_all_db),
-                       batchStart=1,
-                       resolution = 0.04166665,
-                       dims = '224x224')
+if __name__ == "__main__":
+
+    export_images_to_drive(
+        dataframe=locations,
+        start_index=0,
+        end_index=len(locations)
+    )
+
+    print("All export tasks submitted.")
